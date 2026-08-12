@@ -36,33 +36,26 @@ def search_movies(genre: str) -> str:
 
 
 @tool
-def change_to_f(temp_c: float) -> float:
-    """Converts Celsius temperature to Fahrenheit."""
-    return temp_c * 1.8 + 32
+def change__to_f(temp_c: float) -> float:
+    """converts the cel temp to F temperature"""
+    return temp_c * (1.8) + 32
 
 
 @tool
 def get_weather(city: str) -> str:
     """Get current temperature for a given city name."""
-
     geo_url = "https://geocoding-api.open-meteo.com/v1/search"
     geo_params = {"name": city, "count": 1}
-
-    geo_response = requests.get(
-        geo_url,
-        params=geo_params
-    ).json()
+    geo_response = requests.get(geo_url, params=geo_params).json()
 
     if "results" not in geo_response:
         return f"Could not find weather data for city: {city}"
 
     location = geo_response["results"][0]
-
     latitude = location["latitude"]
     longitude = location["longitude"]
 
     weather_url = "https://api.open-meteo.com/v1/forecast"
-
     weather_params = {
         "latitude": latitude,
         "longitude": longitude,
@@ -84,14 +77,12 @@ def get_weather(city: str) -> str:
     return json.dumps(result)
 
 
-tools = [
-    get_weather,
-    search_movies,
-    change_to_f
-]
+tools = [get_weather, search_movies, change__to_f]
 
 
 # --- 2. Initialize Model & Agent ---
+
+# Retrieve the key from the OS environment instead of Colab's userdata
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
@@ -105,13 +96,9 @@ agent = create_agent(
     model=llm_flash,
     tools=tools,
     system_prompt=(
-        "You are a specialized agent restricted ONLY to Indian weather "
-        "and cinema. "
-        "For any other roles, topics, questions, or general knowledge "
-        "outside of Indian weather and movies, "
-        "you must say exactly: "
-        "'I am not authorized to answer questions outside of Indian "
-        "weather and cinema.'"
+        "You are a specialized agent restricted ONLY to Indian weather and cinema. "
+        "For any other roles, topics, questions, or general knowledge outside of Indian weather and movies, "
+        "you must say exactly: 'I am not authorized to answer questions outside of Indian weather and cinema.'"
     )
 )
 
@@ -122,33 +109,36 @@ class AgentInput(BaseModel):
 
 def format_for_agent(x) -> dict:
     user_input = x["input"] if isinstance(x, dict) else x.input
-    return {
-        "messages": [
-            ("user", user_input)
-        ]
-    }
+    return {"messages": [("user", user_input)]}
 
 
-def extract_text_response(agent_output: dict) -> str:
+def extract_text_response(agent_output) -> str:
     if not isinstance(agent_output, dict):
         return str(agent_output)
 
+    # Case 1: top-level messages
     messages = agent_output.get("messages")
 
+    # Case 2: nested under a node name, e.g. {"model": {"messages": [...]}}
+    if messages is None:
+        for value in agent_output.values():
+            if isinstance(value, dict):
+                messages = value.get("messages")
+
+                if messages:
+                    break
+
     if messages:
-        for message in reversed(messages):
-            content = getattr(message, "content", None)
+        last = messages[-1]
+        content = getattr(last, "content", None)
 
-            if isinstance(content, str) and content:
-                return content
+        if isinstance(content, str):
+            return content
 
-            if isinstance(content, list):
-                for item in content:
-                    if (
-                        isinstance(item, dict)
-                        and item.get("type") == "text"
-                    ):
-                        return item.get("text", "")
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    return item.get("text", "")
 
     return str(agent_output)
 
@@ -168,30 +158,20 @@ formatted_agent_chain = (
 app = FastAPI(
     title="Movie & Weather Agent",
     version="1.0",
-    description="A LangChain agent (Gemini) with search_movies and "
-                "get_weather tools, served via LangServe."
+    description="A Langchain agent (Gemini) with search_movies and get_weather tools, served via LangServe.",
 )
 
 
 @app.get("/")
 def root():
     return {
-        "message": "Server is running. Visit /agent/playground/ "
-                   "to chat, or /docs for the API."
+        "message": "Server is running. Visit /agent/playground/ to chat, or /docs for the API."
     }
 
 
-add_routes(
-    app,
-    formatted_agent_chain,
-    path="/agent"
-)
+add_routes(app, formatted_agent_chain, path="/agent")
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=port
-    )
+    uvicorn.run(app, host="0.0.0.0", port=port)
