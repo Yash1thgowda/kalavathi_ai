@@ -1,6 +1,7 @@
 import sys
 import io
 import traceback
+import requests
 from typing import TypedDict, List, Optional
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.tools import tool
@@ -135,7 +136,19 @@ def generate_test_cases(task_description: str) -> str:
    return response.content if hasattr(response, 'content') else str(response)
 
 
+@tool
+def search_indian_history(topic: str) -> str:
+    """Search Wikipedia for information about Indian history."""
 
+    url = "https://en.wikipedia.org/api/rest_v1/page/summary/" + topic.replace(" ", "_")
+
+    response = requests.get(url)
+
+    if response.status_code == 200:
+        data = response.json()
+        return data.get("extract", "No historical information found.")
+
+    return f"Could not find information about {topic}."
 # Initialize the test tool with the LLM
 
 # (Uncomment this once your LLM is initialized above)
