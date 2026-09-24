@@ -1,398 +1,238 @@
-````python
 import os
 import io
 import traceback
-from typing import TypedDict, List, Optional
+from typing import TypedDict
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, START, END
 
 
-# ============================================================
-# 1. FASTAPI APPLICATION
-# ============================================================
+api_key = os.getenv("GEMINI_API_KEY")
+
+if not api_key:
+    raise RuntimeError("GEMINI_API_KEY environment variable is not set.")
+
 
 app = FastAPI(
     title="Kalavathi AI",
-    description="AI-powered Developer, Tester and Manager workflow",
+    description="AI-powered coding development and testing workflow",
     version="1.0.0"
 )
 
 
-# ============================================================
-# 2. API KEY / LLM INITIALIZATION
-# ============================================================
-
-api_key = os.getenv("GEMINI_API_KEY")
-
-if not api_key:
-    raise RuntimeError(
-        "GEMINI_API_KEY environment variable is not set."
-    )
-
-
-llm_flash = ChatGoogleGenerativeAI(
+llm = ChatGoogleGenerativeAI(
     model="gemini-3.1-flash-lite-preview",
-    google_api_key=api_key
+    google_api_key=api_key,
+    temperature=0
 )
 
-llm = llm_flash
-
-
-# ============================================================
-# 3. STATE
-# ============================================================
 
 class CrewState(TypedDict, total=False):
-    messages: List[BaseMessage]
-    next_step: Optional[str]
-    code: Optional[str]
-    report: Optional[str]
+    task: str
+    generated_code: str
+    test_cases: str
+    test_result: str
+    report: str
 
 
-# ============================================================
-# 4. REQUEST / RESPONSE MODELS
-# ============================================================
-
-class TaskRequest(BaseModel):
+class RunRequest(BaseModel):
     task: str
 
 
-class TaskResponse(BaseModel):
+class RunResponse(BaseModel):
     task: str
     generated_code: str
     report: str
 
 
-# ============================================================
-# 5. TOOLS
-# ============================================================
-
 @tool
 def run_python_code(code: str) -> str:
     """
-    Execute generated Python code and return its output
-    or an error message.
+    Executes Python code and returns its output.
     """
 
-    if not isinstance(code, str):
-        code = str(code)
-
-    clean_code = (
-        code
-        .replace("```python", "")
-        .replace("```", "")
-        .strip()
-    )
-
-    old_stdout = io.StringIO()
-
-    import sys
-
-    previous_stdout = sys.stdout
-    sys.stdout = old_stdout
+    output = io.StringIO()
 
     try:
-        local_scope = {}
+        namespace = {}
 
-        exec(
-            clean_code,
-            {},
-            local_scope
-        )
+        old_stdout = __import__("sys").stdout
+        __import__("sys").stdout = output
 
-        result = old_stdout.getvalue()
+        try:
+            exec(code, namespace)
+        finally:
+            __import__("sys").stdout = old_stdout
 
-        if result.strip():
-            return result.strip()
+        result = output.getvalue()
 
-        return "Success (no terminal output)"
+        if not result:
+            result = "Code executed successfully with no output."
+
+        return result
 
     except Exception:
-        return (
-            "Execution Error:\n"
-            + traceback.format_exc()
-        )
-
-    finally:
-        sys.stdout = previous_stdout
+        return traceback.format_exc()
 
 
 @tool
-def generate_test_cases(task_description: str) -> str:
+def generate_test_cases(code: str) -> str:
     """
-    Generate test scenarios for the coding task.
+    Generates test cases for the provided code.
     """
 
     prompt = f"""
-You are a Senior QA Engineer.
+You are a software tester.
 
-Analyze the following coding task:
+Analyze the following Python code and generate useful test cases.
 
-{task_description}
+CODE:
+{code}
 
-Generate 3 to 5 specific test scenarios.
-
-Include:
-1. Normal cases
+Provide:
+1. Normal test cases
 2. Edge cases
-3. Boundary cases where applicable
+3. Invalid input cases where applicable
+4. Expected output for each case
 
-Return only a numbered list of test scenarios.
+Keep the response concise and structured.
 """
 
-    response = llm.invoke(prompt)
+    response = llm.invoke([HumanMessage(content=prompt)])
 
-    content = response.content
-
-    if isinstance(content, list):
-
-        if not content:
-            return "No test cases generated."
-
-        first_item = content[0]
-
-        if isinstance(first_item, dict):
-            return str(first_item.get("text", ""))
-
-        return str(first_item)
-
-    return str(content)
+    return response.content
 
 
-# ============================================================
-# 6. LANGGRAPH NODES
-# ============================================================
-
-def developer_node(state: CrewState):
-    """
-    Developer Agent:
-    Generates Python code for the user's task.
-    """
-
-    task = state["messages"][-1].content
+def developer_node(state: CrewState) -> CrewState:
+    task = state["task"]
 
     prompt = f"""
-You are the Developer Agent of Kalavathi AI.
+You are the Developer agent.
 
-Solve the following programming task:
+Solve the following programming task.
 
+TASK:
 {task}
 
 Requirements:
-- Write clean Python code.
-- Make the program executable.
-- Handle reasonable edge cases.
-- Do not provide explanations.
-- Do not use Markdown.
-- Return ONLY the Python code.
+- Write complete Python code.
+- Make the solution executable.
+- Do not use Markdown code fences.
+- Do not explain the code.
+- Return only the Python source code.
 """
 
-    response = llm_flash.invoke(prompt)
+    response = llm.invoke([HumanMessage(content=prompt)])
 
-    content = response.content
+    code = response.content.strip()
 
-    if isinstance(content, list):
+    if code.startswith("```"):
+        lines = code.splitlines()
 
-        if not content:
-            code = ""
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
 
-        else:
-            first_item = content[0]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
 
-            if isinstance(first_item, dict):
-                code = str(first_item.get("text", ""))
-
-            else:
-                code = str(first_item)
-
-    else:
-        code = str(content)
+        code = "\n".join(lines).strip()
 
     return {
-        "code": code
+        **state,
+        "generated_code": code
     }
 
 
-def tester_node(state: CrewState):
-    """
-    Tester Agent:
-    Generates test scenarios and executes the generated code.
-    """
+def tester_node(state: CrewState) -> CrewState:
+    code = state["generated_code"]
 
-    task = state["messages"][-1].content
-    code = state.get("code", "")
-
-    test_cases = generate_test_cases.invoke(
-        task
-    )
-
-    execution_result = run_python_code.invoke(
-        {
+    try:
+        test_cases = generate_test_cases.invoke({
             "code": code
-        }
-    )
+        })
 
-    report = (
-        "### TEST SCENARIOS\n"
-        f"{test_cases}\n\n"
-        "### CODE EXECUTION RESULT\n"
-        f"{execution_result}"
-    )
+        execution_result = run_python_code.invoke({
+            "code": code
+        })
+
+        test_result = (
+            "GENERATED TEST CASES:\n"
+            + test_cases
+            + "\n\nINITIAL EXECUTION RESULT:\n"
+            + execution_result
+        )
+
+    except Exception as e:
+        test_result = f"Testing failed:\n{traceback.format_exc()}"
 
     return {
-        "report": report
+        **state,
+        "test_cases": test_cases if "test_cases" in locals() else "",
+        "test_result": test_result
     }
 
 
-def manager_node(state: CrewState):
-    """
-    Manager Agent:
-    Reviews the developer and tester output
-    and produces the final result.
-    """
+def manager_node(state: CrewState) -> CrewState:
+    task = state["task"]
+    code = state["generated_code"]
+    test_result = state.get("test_result", "")
 
-    task = state["messages"][-1].content
-    code = state.get("code", "")
-    report = state.get(
-        "report",
-        "No test report available."
-    )
+    prompt = f"""
+You are the Manager agent reviewing a software development task.
 
-    manager_prompt = f"""
-You are the Manager Agent of Kalavathi AI.
-
-Review the work produced by the Developer and Tester.
-
-USER TASK:
+TASK:
 {task}
 
 GENERATED CODE:
 {code}
 
-TEST REPORT:
-{report}
+TESTING INFORMATION:
+{test_result}
 
-Provide a concise final assessment.
+Review the implementation and produce a concise final report.
 
 Include:
-- Whether the generated code executed successfully
-- Important problems found
-- Any obvious improvement needed
+- Task summary
+- Code status
+- Testing status
+- Problems found, if any
+- Suggested improvements, if any
 
 Do not rewrite the entire code.
 """
 
-    response = llm_flash.invoke(
-        manager_prompt
-    )
-
-    content = response.content
-
-    if isinstance(content, list):
-
-        if content:
-
-            first_item = content[0]
-
-            if isinstance(first_item, dict):
-                manager_result = str(
-                    first_item.get("text", "")
-                )
-            else:
-                manager_result = str(first_item)
-
-        else:
-            manager_result = "No manager assessment."
-
-    else:
-        manager_result = str(content)
-
-    final_report = (
-        f"{report}\n\n"
-        "### MANAGER ASSESSMENT\n"
-        f"{manager_result}"
-    )
+    response = llm.invoke([HumanMessage(content=prompt)])
 
     return {
-        "report": final_report,
-        "next_step": "end"
+        **state,
+        "report": response.content
     }
 
 
-# ============================================================
-# 7. LANGGRAPH
-# ============================================================
-
 workflow = StateGraph(CrewState)
 
+workflow.add_node("developer", developer_node)
+workflow.add_node("tester", tester_node)
+workflow.add_node("manager", manager_node)
 
-workflow.add_node(
-    "developer",
-    developer_node
-)
-
-workflow.add_node(
-    "tester",
-    tester_node
-)
-
-workflow.add_node(
-    "manager",
-    manager_node
-)
-
-
-# START → Developer
-workflow.add_edge(
-    START,
-    "developer"
-)
-
-
-# Developer → Tester
-workflow.add_edge(
-    "developer",
-    "tester"
-)
-
-
-# Tester → Manager
-workflow.add_edge(
-    "tester",
-    "manager"
-)
-
-
-# Manager → END
-workflow.add_edge(
-    "manager",
-    END
-)
-
+workflow.add_edge(START, "developer")
+workflow.add_edge("developer", "tester")
+workflow.add_edge("tester", "manager")
+workflow.add_edge("manager", END)
 
 graph = workflow.compile()
 
 
-# ============================================================
-# 8. FASTAPI ROUTES
-# ============================================================
-
 @app.get("/")
-def home():
+def root():
     return {
-        "name": "Kalavathi AI",
-        "status": "running",
-        "workflow": [
-            "Developer",
-            "Tester",
-            "Manager"
-        ]
+        "message": "Kalavathi AI is running",
+        "status": "online"
     }
 
 
@@ -403,9 +243,8 @@ def health():
     }
 
 
-@app.post("/run", response_model=TaskResponse)
-def run_task(request: TaskRequest):
-
+@app.post("/run", response_model=RunResponse)
+def run_task(request: RunRequest):
     task = request.task.strip()
 
     if not task:
@@ -415,56 +254,27 @@ def run_task(request: TaskRequest):
         )
 
     try:
+        result = graph.invoke({
+            "task": task
+        })
 
-        initial_state: CrewState = {
-            "messages": [
-                HumanMessage(
-                    content=task
-                )
-            ]
-        }
-
-        result = graph.invoke(
-            initial_state,
-            config={
-                "recursion_limit": 20
-            }
-        )
-
-        return TaskResponse(
+        return RunResponse(
             task=task,
-            generated_code=result.get(
-                "code",
-                ""
-            ),
-            report=result.get(
-                "report",
-                "No report generated."
-            )
+            generated_code=result.get("generated_code", ""),
+            report=result.get("report", "")
         )
 
     except Exception as e:
-
         raise HTTPException(
             status_code=500,
             detail=str(e)
         )
 
 
-# ============================================================
-# 9. LOCAL EXECUTION
-# ============================================================
-
 if __name__ == "__main__":
-
     import uvicorn
 
-    port = int(
-        os.getenv(
-            "PORT",
-            "8000"
-        )
-    )
+    port = int(os.getenv("PORT", "8000"))
 
     uvicorn.run(
         app,
