@@ -1,29 +1,40 @@
 ````python
 import os
-import sys
 import io
 import traceback
-import requests
-
 from typing import TypedDict, List, Optional
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.tools import tool
-from langgraph.graph import StateGraph, START, END
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import StateGraph, START, END
 
 
-# ==========================================
-# 1. LLM INITIALIZATION
-# ==========================================
+# ============================================================
+# 1. FASTAPI APPLICATION
+# ============================================================
+
+app = FastAPI(
+    title="Kalavathi AI",
+    description="AI-powered Developer, Tester and Manager workflow",
+    version="1.0.0"
+)
+
+
+# ============================================================
+# 2. API KEY / LLM INITIALIZATION
+# ============================================================
 
 api_key = os.getenv("GEMINI_API_KEY")
 
 if not api_key:
-    raise ValueError(
-        "GEMINI_API_KEY is not set. "
-        "Set it as an environment variable before running the application."
+    raise RuntimeError(
+        "GEMINI_API_KEY environment variable is not set."
     )
+
 
 llm_flash = ChatGoogleGenerativeAI(
     model="gemini-3.1-flash-lite-preview",
@@ -33,24 +44,41 @@ llm_flash = ChatGoogleGenerativeAI(
 llm = llm_flash
 
 
-# ==========================================
-# 2. STATE DEFINITION
-# ==========================================
+# ============================================================
+# 3. STATE
+# ============================================================
 
-class CrewState(TypedDict):
+class CrewState(TypedDict, total=False):
     messages: List[BaseMessage]
     next_step: Optional[str]
     code: Optional[str]
     report: Optional[str]
 
 
-# ==========================================
-# 3. TOOLS
-# ==========================================
+# ============================================================
+# 4. REQUEST / RESPONSE MODELS
+# ============================================================
+
+class TaskRequest(BaseModel):
+    task: str
+
+
+class TaskResponse(BaseModel):
+    task: str
+    generated_code: str
+    report: str
+
+
+# ============================================================
+# 5. TOOLS
+# ============================================================
 
 @tool
 def run_python_code(code: str) -> str:
-    """Execute Python code and return the standard output or error trace."""
+    """
+    Execute generated Python code and return its output
+    or an error message.
+    """
 
     if not isinstance(code, str):
         code = str(code)
@@ -62,181 +90,159 @@ def run_python_code(code: str) -> str:
         .strip()
     )
 
-    old_stdout = sys.stdout
-    new_stdout = io.StringIO()
+    old_stdout = io.StringIO()
 
-    sys.stdout = new_stdout
+    import sys
+
+    previous_stdout = sys.stdout
+    sys.stdout = old_stdout
 
     try:
         local_scope = {}
 
-        exec(clean_code, {}, local_scope)
+        exec(
+            clean_code,
+            {},
+            local_scope
+        )
 
-        result = new_stdout.getvalue()
+        result = old_stdout.getvalue()
+
+        if result.strip():
+            return result.strip()
+
+        return "Success (no terminal output)"
 
     except Exception:
-        result = f"Execution Error:\n{traceback.format_exc()}"
+        return (
+            "Execution Error:\n"
+            + traceback.format_exc()
+        )
 
     finally:
-        sys.stdout = old_stdout
-
-    return (
-        result.strip()
-        if result.strip()
-        else "Success (no terminal output)"
-    )
+        sys.stdout = previous_stdout
 
 
 @tool
 def generate_test_cases(task_description: str) -> str:
-    """Generate specific test scenarios for a given coding task."""
+    """
+    Generate test scenarios for the coding task.
+    """
 
-    prompt = (
-        "You are a Senior QA Engineer.\n\n"
-        f"Generate 3 to 5 highly specific test scenarios "
-        f"for the following coding task:\n\n"
-        f"{task_description}\n\n"
-        "Include both standard cases and edge cases.\n"
-        "Return the scenarios as a numbered list."
-    )
+    prompt = f"""
+You are a Senior QA Engineer.
+
+Analyze the following coding task:
+
+{task_description}
+
+Generate 3 to 5 specific test scenarios.
+
+Include:
+1. Normal cases
+2. Edge cases
+3. Boundary cases where applicable
+
+Return only a numbered list of test scenarios.
+"""
 
     response = llm.invoke(prompt)
-
-    return (
-        response.content
-        if hasattr(response, "content")
-        else str(response)
-    )
-
-
-@tool
-def search_indian_history(topic: str) -> str:
-    """Search Wikipedia for information about Indian history."""
-
-    url = (
-        "https://en.wikipedia.org/api/rest_v1/page/summary/"
-        + topic.replace(" ", "_")
-    )
-
-    try:
-        response = requests.get(url, timeout=10)
-
-        if response.status_code == 200:
-            data = response.json()
-
-            return data.get(
-                "extract",
-                "No historical information found."
-            )
-
-        return f"Could not find information about {topic}."
-
-    except requests.RequestException as e:
-        return f"History search failed: {e}"
-
-
-# ==========================================
-# 4. GRAPH NODES
-# ==========================================
-
-def task_input_node(state: CrewState):
-    print("\n" + "=" * 50)
-    print("--- NEW TASK INITIALIZATION ---")
-
-    user_task = input(
-        "Enter the coding task (or type 'exit' to quit): "
-    ).strip()
-
-    if user_task.lower() == "exit":
-        return {
-            "next_step": "exit"
-        }
-
-    return {
-        "messages": [HumanMessage(content=user_task)],
-        "next_step": "developer"
-    }
-
-
-def real_time_developer(state: CrewState):
-    print("\n[Developer] Writing dynamic code using LLM...")
-
-    task = state["messages"][-1].content
-
-    dev_prompt = (
-        "Write a clean Python script to solve the following coding task.\n\n"
-        f"Task:\n{task}\n\n"
-        "Only return the Python code. "
-        "Do not include explanations or markdown formatting."
-    )
-
-    response = llm_flash.invoke(dev_prompt)
 
     content = response.content
 
     if isinstance(content, list):
 
-        if content:
-            first_item = content[0]
+        if not content:
+            return "No test cases generated."
 
-            if isinstance(first_item, dict):
-                code_str = first_item.get("text", "")
-            else:
-                code_str = str(first_item)
+        first_item = content[0]
 
-        else:
-            code_str = ""
+        if isinstance(first_item, dict):
+            return str(first_item.get("text", ""))
 
-    else:
-        code_str = str(content)
+        return str(first_item)
 
-    print("\n--- GENERATED CODE ---")
-    print(code_str)
-
-    return {
-        "code": code_str
-    }
+    return str(content)
 
 
-def real_time_tester(state: CrewState):
-    print("\n[Tester] Generating dynamic tests and executing code...")
+# ============================================================
+# 6. LANGGRAPH NODES
+# ============================================================
+
+def developer_node(state: CrewState):
+    """
+    Developer Agent:
+    Generates Python code for the user's task.
+    """
 
     task = state["messages"][-1].content
 
-    # Generate test scenarios
-    test_cases = generate_test_cases.invoke(task)
+    prompt = f"""
+You are the Developer Agent of Kalavathi AI.
 
-    content = test_cases
+Solve the following programming task:
+
+{task}
+
+Requirements:
+- Write clean Python code.
+- Make the program executable.
+- Handle reasonable edge cases.
+- Do not provide explanations.
+- Do not use Markdown.
+- Return ONLY the Python code.
+"""
+
+    response = llm_flash.invoke(prompt)
+
+    content = response.content
 
     if isinstance(content, list):
 
-        if content:
+        if not content:
+            code = ""
+
+        else:
             first_item = content[0]
 
             if isinstance(first_item, dict):
-                cases_str = first_item.get("text", "")
-            else:
-                cases_str = str(first_item)
+                code = str(first_item.get("text", ""))
 
-        else:
-            cases_str = ""
+            else:
+                code = str(first_item)
 
     else:
-        cases_str = str(content)
+        code = str(content)
 
-    # Execute generated code
+    return {
+        "code": code
+    }
+
+
+def tester_node(state: CrewState):
+    """
+    Tester Agent:
+    Generates test scenarios and executes the generated code.
+    """
+
+    task = state["messages"][-1].content
+    code = state.get("code", "")
+
+    test_cases = generate_test_cases.invoke(
+        task
+    )
+
     execution_result = run_python_code.invoke(
         {
-            "code": state["code"]
+            "code": code
         }
     )
 
-    # Compile report
     report = (
-        "### EXECUTION OUTPUT:\n"
-        f"{execution_result}\n\n"
-        "### TEST SCENARIOS:\n"
-        f"{cases_str}"
+        "### TEST SCENARIOS\n"
+        f"{test_cases}\n\n"
+        "### CODE EXECUTION RESULT\n"
+        f"{execution_result}"
     )
 
     return {
@@ -244,223 +250,463 @@ def real_time_tester(state: CrewState):
     }
 
 
-def manager_decision_node(state: CrewState):
-    print("\n" + "=" * 50)
-    print("--- MANAGER DASHBOARD : TEST REPORT ---")
+def manager_node(state: CrewState):
+    """
+    Manager Agent:
+    Reviews the developer and tester output
+    and produces the final result.
+    """
 
-    print(
-        state.get(
-            "report",
-            "No report available."
-        )
+    task = state["messages"][-1].content
+    code = state.get("code", "")
+    report = state.get(
+        "report",
+        "No test report available."
     )
 
-    print("=" * 50)
+    manager_prompt = f"""
+You are the Manager Agent of Kalavathi AI.
 
-    user_input = input(
-        "\nCommand (store / another): "
-    ).lower().strip()
+Review the work produced by the Developer and Tester.
 
-    if user_input == "store":
+USER TASK:
+{task}
 
-        return {
-            "next_step": "archiver"
-        }
+GENERATED CODE:
+{code}
+
+TEST REPORT:
+{report}
+
+Provide a concise final assessment.
+
+Include:
+- Whether the generated code executed successfully
+- Important problems found
+- Any obvious improvement needed
+
+Do not rewrite the entire code.
+"""
+
+    response = llm_flash.invoke(
+        manager_prompt
+    )
+
+    content = response.content
+
+    if isinstance(content, list):
+
+        if content:
+
+            first_item = content[0]
+
+            if isinstance(first_item, dict):
+                manager_result = str(
+                    first_item.get("text", "")
+                )
+            else:
+                manager_result = str(first_item)
+
+        else:
+            manager_result = "No manager assessment."
+
+    else:
+        manager_result = str(content)
+
+    final_report = (
+        f"{report}\n\n"
+        "### MANAGER ASSESSMENT\n"
+        f"{manager_result}"
+    )
 
     return {
-        "next_step": "task_input"
+        "report": final_report,
+        "next_step": "end"
     }
 
 
-def archiver_node(state: CrewState):
-    print(
-        "\n[Archiver] Task stored successfully. "
-        "Closing workflow."
-    )
+# ============================================================
+# 7. LANGGRAPH
+# ============================================================
 
-    return {
-        "next_step": "exit"
-    }
+workflow = StateGraph(CrewState)
 
 
-# ==========================================
-# 5. GRAPH CONSTRUCTION & ROUTING
-# ==========================================
-
-rt_workflow = StateGraph(CrewState)
-
-
-# Nodes
-rt_workflow.add_node(
-    "task_input",
-    task_input_node
-)
-
-rt_workflow.add_node(
+workflow.add_node(
     "developer",
-    real_time_developer
+    developer_node
 )
 
-rt_workflow.add_node(
+workflow.add_node(
     "tester",
-    real_time_tester
+    tester_node
 )
 
-rt_workflow.add_node(
-    "manager_decision",
-    manager_decision_node
-)
-
-rt_workflow.add_node(
-    "archiver",
-    archiver_node
+workflow.add_node(
+    "manager",
+    manager_node
 )
 
 
-# START → Task Input
-rt_workflow.add_edge(
+# START → Developer
+workflow.add_edge(
     START,
-    "task_input"
-)
-
-
-# Task Input routing
-def route_from_input(state: CrewState):
-
-    if state.get("next_step") == "exit":
-        return END
-
-    return "developer"
-
-
-rt_workflow.add_conditional_edges(
-    "task_input",
-    route_from_input
+    "developer"
 )
 
 
 # Developer → Tester
-rt_workflow.add_edge(
+workflow.add_edge(
     "developer",
     "tester"
 )
 
 
 # Tester → Manager
-rt_workflow.add_edge(
+workflow.add_edge(
     "tester",
-    "manager_decision"
+    "manager"
 )
 
 
-# Manager routing
-def route_from_decision(state: CrewState):
-
-    if state.get("next_step") == "archiver":
-        return "archiver"
-
-    return "task_input"
-
-
-rt_workflow.add_conditional_edges(
-    "manager_decision",
-    route_from_decision
-)
-
-
-# Archiver → END
-rt_workflow.add_edge(
-    "archiver",
+# Manager → END
+workflow.add_edge(
+    "manager",
     END
 )
 
 
-# Compile graph
-rt_app = rt_workflow.compile()
+graph = workflow.compile()
 
 
-print(
-    "Interactive pipeline compiled and ready for live execution."
-)
+# ============================================================
+# 8. FASTAPI ROUTES
+# ============================================================
+
+@app.get("/")
+def home():
+    return {
+        "name": "Kalavathi AI",
+        "status": "running",
+        "workflow": [
+            "Developer",
+            "Tester",
+            "Manager"
+        ]
+    }
 
 
-# ==========================================
-# 6. EXECUTION
-# ==========================================
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy"
+    }
 
-if __name__ == "__main__":
+
+@app.post("/run", response_model=TaskResponse)
+def run_task(request: TaskRequest):
+
+    task = request.task.strip()
+
+    if not task:
+        raise HTTPException(
+            status_code=400,
+            detail="Task cannot be empty."
+        )
 
     try:
 
-        rt_app.invoke(
-            {
-                "messages": []
-            },
+        initial_state: CrewState = {
+            "messages": [
+                HumanMessage(
+                    content=task
+                )
+            ]
+        }
+
+        result = graph.invoke(
+            initial_state,
             config={
-                "recursion_limit": 50
+                "recursion_limit": 20
             }
         )
 
-    except KeyboardInterrupt:
-
-        print(
-            "\nStopped by user."
+        return TaskResponse(
+            task=task,
+            generated_code=result.get(
+                "code",
+                ""
+            ),
+            report=result.get(
+                "report",
+                "No report generated."
+            )
         )
 
     except Exception as e:
 
-        print(
-            f"\nAn error occurred: {e}"
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
         )
+
+
+# ============================================================
+# 9. LOCAL EXECUTION
+# ============================================================
+
+if __name__ == "__main__":
+
+    import uvicorn
+
+    port = int(
+        os.getenv(
+            "PORT",
+            "8000"
+        )
+    )
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port
+    )
 ````
 
-### What changed
+### And change `requirements.txt`
 
-The important change is that these are **gone**:
+Your current requirements already contain FastAPI, Uvicorn, LangServe, LangChain and the Gemini integration.
+
+For this corrected `app.py`, use:
+
+```text
+fastapi
+uvicorn
+langchain-core
+langchain
+langchain-google-genai
+langgraph
+requests
+pydantic
+```
+
+You **don't need `langserve` or `sse_starlette` for this version**, because we're exposing a normal FastAPI `/run` endpoint rather than using LangServe.
+
+## What this fixes
+
+### 1. Google Colab is completely gone
+
+Your old code had:
 
 ```python
 import google.generativeai as genai
 from google.colab import userdata
 ```
 
-and this entire Colab-specific section:
+and pulled the key from Colab secrets. That's exactly what cannot work on Render.
 
-```python
-api_key = userdata.get("GEMINI_API_KEY")
-genai.configure(api_key=api_key)
-```
-
-is replaced by:
+Now:
 
 ```python
 api_key = os.getenv("GEMINI_API_KEY")
-
-if not api_key:
-    raise ValueError("GEMINI_API_KEY is not set...")
 ```
 
-So the application is no longer dependent on Google Colab. Your LangGraph structure itself remains the same.
+Render supplies the key.
 
-### One more thing: `requirements.txt`
+---
 
-Your current requirements contain `fastapi`, `uvicorn`, `langserve`, `sse_starlette`, etc., even though this current `app.py` doesn't import those components.
+### 2. Your Render command now actually makes sense
 
-For **this exact CLI version**, I'd simplify it to:
+You currently have:
 
 ```text
-langchain-core
-langchain
-langchain-google-genai
-langgraph
-requests
+uvicorn app:app --host 0.0.0.0 --port $PORT
 ```
 
-Then locally:
+The new code actually contains:
 
-```bash
-pip install -r requirements.txt
+```python
+app = FastAPI(...)
 ```
 
-and set your API key.
+So:
 
-**Important:** this version fixes the **Colab dependency**, but it does **not yet fix the deeper Tester issue or sandbox the `exec()` execution**. Those are separate changes and should be done deliberately, not smuggled into the same edit like software developers hiding cables behind a desk.
+```text
+Render
+   ↓
+uvicorn
+   ↓
+app.py
+   ↓
+FastAPI app
+   ↓
+LangGraph
+   ↓
+Developer
+   ↓
+Tester
+   ↓
+Manager
+```
+
+That's the architecture you were trying to deploy.
+
+---
+
+### 3. No more `input()`
+
+This is important.
+
+Your original graph depended on:
+
+```python
+input(...)
+```
+
+for the coding task and manager decision. That makes sense in a terminal, but not as a normal Render web service. Your original code contains those interactive `input()` calls.
+
+Now the task comes through HTTP:
+
+```text
+POST /run
+```
+
+with:
+
+```json
+{
+  "task": "Write a Python program to find the second largest number in an array"
+}
+```
+
+The response contains:
+
+```json
+{
+  "task": "...",
+  "generated_code": "...",
+  "report": "..."
+}
+```
+
+---
+
+## What you need to do on Render
+
+### Environment variable
+
+In Render:
+
+**Your service → Environment Variables**
+
+Add:
+
+```text
+GEMINI_API_KEY
+```
+
+with your actual Gemini API key.
+
+Do **not** put the key inside `app.py` or GitHub.
+
+### Start command
+
+Keep:
+
+```text
+uvicorn app:app --host 0.0.0.0 --port $PORT
+```
+
+### Then deploy
+
+Push the two changed files:
+
+```text
+app.py
+requirements.txt
+```
+
+to GitHub.
+
+Render should automatically redeploy.
+
+---
+
+## How to test it
+
+After deployment, open:
+
+```text
+https://YOUR-RENDER-DOMAIN/
+```
+
+You should get something like:
+
+```json
+{
+  "name": "Kalavathi AI",
+  "status": "running",
+  "workflow": [
+    "Developer",
+    "Tester",
+    "Manager"
+  ]
+}
+```
+
+Then:
+
+```text
+https://YOUR-RENDER-DOMAIN/docs
+```
+
+FastAPI will give you an interactive API page.
+
+You'll see:
+
+```text
+GET  /
+GET  /health
+POST /run
+```
+
+For `/run`, click **Try it out** and enter:
+
+```json
+{
+  "task": "Write a Python program to check whether a number is prime"
+}
+```
+
+Then execute it.
+
+Your LangGraph flow will actually run:
+
+```text
+              ┌──────────────┐
+              │    START     │
+              └──────┬───────┘
+                     ↓
+             ┌───────────────┐
+             │   DEVELOPER   │
+             │ Generate code │
+             └───────┬───────┘
+                     ↓
+             ┌───────────────┐
+             │    TESTER     │
+             │ Tests + exec  │
+             └───────┬───────┘
+                     ↓
+             ┌───────────────┐
+             │    MANAGER    │
+             │ Review result │
+             └───────┬───────┘
+                     ↓
+                   END
+```
+
+That's now a **real web-accessible LangGraph application**, rather than a Colab script wearing a Render deployment costume.
+
+### One remaining technical issue
+
+I intentionally left your `exec()` approach in place for now because that's part of your current prototype. It **executes AI-generated Python inside the Render process**, which is not something I'd expose as a production-grade public coding agent. We should sandbox that next. Also, the current tester still generates test *scenarios* rather than independently executing each expected test case. Those are the next two substantive engineering improvements.
